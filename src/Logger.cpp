@@ -12,6 +12,8 @@
 #include <cstring>
 #include <vector>
 
+#include "slog.h"
+
 #ifndef ARDUINO_V3
 #ifdef Serial
 #undef Serial
@@ -71,14 +73,20 @@ int LoggerVprintf(const char* format, va_list args) {
     int required = vsnprintf(nullptr, 0, format, argsForLength);
     va_end(argsForLength);
 
-    // Format and send to TCP client if connected
-    if (required > 0 && tcpEnabled && tcpClient && tcpClient->connected()) {
+    // Format once, reused for TCP debug logging (if connected) and seshat/Loki forwarding.
+    // slog_feed runs unconditionally: internal ESP-IDF log lines (WiFi/heap/task
+    // diagnostics) are exactly the kind of thing worth having centrally after a
+    // silent hang like the floor_2/office_2 incident, independent of whether
+    // anyone has a TCP debug client attached right now.
+    if (required > 0) {
         std::vector<char> buffer(static_cast<size_t>(required) + 1);
         va_list argsForBuffer;
         va_copy(argsForBuffer, args);
         vsnprintf(buffer.data(), buffer.size(), format, argsForBuffer);
         va_end(argsForBuffer);
-        SafeTcpWrite(reinterpret_cast<const uint8_t*>(buffer.data()), static_cast<size_t>(required));
+        if (tcpEnabled && tcpClient && tcpClient->connected())
+            SafeTcpWrite(reinterpret_cast<const uint8_t*>(buffer.data()), static_cast<size_t>(required));
+        slog_feed(buffer.data());
     }
 
     // Call original vprintf (or default if none was set)
@@ -165,6 +173,9 @@ size_t Logger::write(uint8_t ch) {
     // Write to TCP if enabled
     SafeTcpWrite(&ch, 1);
 
+    // Mirror to seshat/Loki
+    slog_feed(reinterpret_cast<const char*>(&ch), 1);
+
     // Write to serial if enabled
     if (serialEnabled_) {
         return serial_.write(ch);
@@ -185,6 +196,9 @@ size_t Logger::write(uint8_t ch) {
 size_t Logger::write(const uint8_t* buffer, size_t size) {
     // Write to TCP if enabled
     SafeTcpWrite(buffer, size);
+
+    // Mirror to seshat/Loki
+    slog_feed(reinterpret_cast<const char*>(buffer), size);
 
     // Write to serial if enabled
     if (serialEnabled_) {
