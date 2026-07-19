@@ -2,6 +2,7 @@
 #include "main.h"
 
 #include "esp_heap_caps.h"
+#include "slog.h"
 
 
 void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *functionName)
@@ -300,6 +301,14 @@ void setupNetwork() {
 
     localIp = MultiNetwork.localIP().toString();
     id = slugify(room);
+
+    // Zentrales Logging (seshat/Loki) - erst ab hier ist die Node-Identitaet
+    // bekannt (Laufzeit-Fleet, siehe Kommentar in slog.h). Alles vor dieser
+    // Zeile (WiFi-Verbindungsaufbau etc.) geht nur ans lokale Serial.
+    slog_set_name(id.c_str());
+    slog_init();
+    slog_boot();
+
     roomsTopic = CHANNEL + String("/rooms/") + id;
     statusTopic = roomsTopic + "/status";
     teleTopic = roomsTopic + "/telemetry";
