@@ -2,12 +2,41 @@
 #include "main.h"
 
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
+#include "esp_task_wdt.h"
 #include "slog.h"
 
 
 void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *functionName)
 {
     ESP_EARLY_LOGE("heap", "%s failed to allocate %lu bytes with 0x%lX capabilities", functionName, static_cast<unsigned long>(requestedSize), static_cast<unsigned long>(caps));
+}
+
+// Independent hardware safety net: reconnect()'s own give-up-after-50-tries
+// restart runs on a FreeRTOS software timer, which stops firing if the
+// underlying network stack itself wedges - observed 2026-07 on floor_2/
+// office_2 (online via MQTT LWT, zero telemetry, local webserver also dead,
+// for 30+ minutes; only a physical power cycle recovered them). A task
+// watchdog registered on the main loop (and the BLE scan task below) resets
+// the device the moment either one stops making progress, regardless of
+// *why* - MQTT, WiFi, BLE/NimBLE, or heap exhaustion all end up here instead
+// of a silent permanent freeze. Deliberately independent of CONFIG_ASYNC_TCP_USE_WDT
+// (disabled fleet-wide, upstream default) - this doesn't rely on AsyncTCP's
+// own watchdog integration at all.
+#define TASK_WDT_TIMEOUT_MS 60000
+
+void setupTaskWatchdog() {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_task_wdt_config_t cfg = {};
+    cfg.timeout_ms = TASK_WDT_TIMEOUT_MS;
+    cfg.idle_core_mask = 0;
+    cfg.trigger_panic = true;
+    if (esp_task_wdt_init(&cfg) == ESP_ERR_INVALID_STATE)
+        esp_task_wdt_reconfigure(&cfg);
+#else
+    esp_task_wdt_init(TASK_WDT_TIMEOUT_MS / 1000, true);
+#endif
+    esp_task_wdt_add(NULL);
 }
 
 /**
@@ -562,6 +591,7 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 void scanTask(void *parameter) {
+    esp_task_wdt_add(NULL);  // register this task too - a wedged NimBLE scan shouldn't go unnoticed either
     NimBLEDevice::init("ESPresense");
     NimBLEDevice::deleteAllBonds();
     Enrollment::Setup();
@@ -586,6 +616,7 @@ void scanTask(void *parameter) {
         log_e("Error starting continuous ble scan");
 
     while (true) {
+        esp_task_wdt_reset();
         size_t cursor = 0;
         while (auto lease = BleFingerprintCollection::AcquireNext(cursor, false)) {
             if (lease.fingerprint->query())
@@ -631,6 +662,7 @@ void setup() {
 #endif
     Log.printf("Pre-Setup Free Mem: %lu\r\n", static_cast<unsigned long>(ESP.getFreeHeap()));
     heap_caps_register_failed_alloc_callback(heapCapsAllocFailedHook);
+    setupTaskWatchdog();
 
 #if M5STICK
     AXP192::Setup();
@@ -640,6 +672,7 @@ void setup() {
     BleFingerprintCollection::Setup();
     SPIFFS.begin(true);
     setupNetwork();
+    esp_task_wdt_reset();
     Log.enableTcp(6053);
     Updater::Setup();
     GUI::Setup(false);
@@ -666,6 +699,7 @@ void setup() {
 #endif
     xTaskCreatePinnedToCore(scanTask, "scanTask", SCAN_TASK_STACK_SIZE, nullptr, 1, &scanTaskHandle, CONFIG_BT_NIMBLE_PINNED_TO_CORE);
     reportSetup();
+    esp_task_wdt_reset();
     Log.printf("Post-Setup Free Mem: %lu\r\n", static_cast<unsigned long>(ESP.getFreeHeap()));
     Log.println();
 }
@@ -682,6 +716,7 @@ void setup() {
  * SerialImprov, NTP, and (conditionally) AXP192 and various sensor modules.
  */
 void loop() {
+    esp_task_wdt_reset();
     reportLoop();
     static unsigned long lastSlowLoop = 0;
     if (millis() - lastSlowLoop > 5000) {
