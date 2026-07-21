@@ -750,4 +750,5 @@ void loop() {
     DS18B20::Loop();
 #endif
 
+    delay(1);  // power: yield instead of busy-polling; all Loop()s above are already millis()-gated
 }
