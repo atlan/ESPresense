@@ -22,12 +22,17 @@
 // AUTOMATISCH (kein Extra-Code nötig): Boot-Report + 5-min-Heartbeat +
 // Absturzkontext (Phase + letzte Logzeile, siehe crash_* unten).
 //
-// Core-Dump-Backtrace (wie im Kanon) ist hier NICHT möglich:
-// partitions_singleapp.csv hat keine coredump-Partition, und nachrüsten liesse
-// sie sich nur per USB-Reflash JEDES Knotens - die Partitionstabelle liegt bei
-// 0x8000 und wird von OTA nicht angefasst. (Platz wäre da: zwischen app1 und
-// eeprom liegen 128 KB brach, 0x3d0000..0x3f0000. Wer die Flotte ohnehin einmal
-// per USB anfasst, kann die Partition also mitnehmen.)
+// ★ Core-Dump-Backtrace (wie im Kanon) ist hier NICHT möglich - und zwar aus
+// einem tieferen Grund als der fehlenden Partition. Am 2026-07-28 nachgemessen:
+// dieses Projekt baut auf tasmota/platform-espressif32 2023.07 (Arduino 2.x),
+// dessen sdkconfig.h CONFIG_ESP_COREDUMP_ENABLE_TO_NONE setzt. Die mitgelieferte
+// libespcoredump.a enthält NULL Definitionen von esp_core_dump_image_check() -
+// die Implementierung ist gar nicht kompiliert, der Panic-Handler schreibt also
+// nie einen Dump. Eine coredump-Partition (Platz wäre da: 128 KB brach zwischen
+// app1 und eeprom, 0x3d0000..0x3f0000) würde daran NICHTS ändern.
+// Voraussetzung wäre ein Wechsel auf pioarduino/Arduino 3.x wie bei horus & Co.
+// - ein eigenes Vorhaben mit echtem Risiko (NimBLE, AsyncTCP, Upstream-Merges),
+// nicht "eine Zeile in der CSV".
 // Ersatz ohne Partitionsänderung: RTC-NOINIT-Kontext - er überlebt PANIC/WDT
 // und sagt, WAS der Knoten tat, als er starb. Kein Backtrace, aber die Frage,
 // die nach einem Absturzschwarm zählt (2026-07-28: 15 Knoten auf einmal).
