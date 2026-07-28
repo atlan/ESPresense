@@ -19,16 +19,22 @@
 //   slog_boot();
 // Bestehenden Logger anzapfen: in Logger::write()/LoggerVprintf() slog_feed(...).
 //
-// AUTOMATISCH (kein Extra-Code nötig): Boot-Report + 5-min-Heartbeat.
-// Core-Dump-Backtrace (wie im Kanon) ist hier NICHT aktiv: die aktuelle
-// partitions_singleapp.csv hat keine coredump-Partition (bräuchte einen
-// vollen USB-Reflash aller Nodes, nicht nur OTA) - reset_reason allein
-// (PANIC/WDT/BROWNOUT vs. normal) reicht aber schon, um "abgestürzt vs.
-// sauber neugestartet" zu unterscheiden. Ein stiller Hänger wie der
-// floor_2/office_2-Vorfall vom 2026-07-19 (Netzwerk-Stack eingefroren, KEIN
-// Reset) zeigt sich ohnehin nicht über reset_reason, sondern darüber, dass
-// der Heartbeat ausbleibt ("Gerät still"-Alert in seshat-alert.py) - das ist
-// hier bereits der Haupt-Nutzen, auch ohne Core-Dump-Partition.
+// AUTOMATISCH (kein Extra-Code nötig): Boot-Report + 5-min-Heartbeat +
+// Absturzkontext (Phase + letzte Logzeile, siehe crash_* unten).
+//
+// Core-Dump-Backtrace (wie im Kanon) ist hier NICHT möglich:
+// partitions_singleapp.csv hat keine coredump-Partition, und nachrüsten liesse
+// sie sich nur per USB-Reflash JEDES Knotens - die Partitionstabelle liegt bei
+// 0x8000 und wird von OTA nicht angefasst. (Platz wäre da: zwischen app1 und
+// eeprom liegen 128 KB brach, 0x3d0000..0x3f0000. Wer die Flotte ohnehin einmal
+// per USB anfasst, kann die Partition also mitnehmen.)
+// Ersatz ohne Partitionsänderung: RTC-NOINIT-Kontext - er überlebt PANIC/WDT
+// und sagt, WAS der Knoten tat, als er starb. Kein Backtrace, aber die Frage,
+// die nach einem Absturzschwarm zählt (2026-07-28: 15 Knoten auf einmal).
+//
+// Ein stiller Hänger wie der floor_2/office_2-Vorfall vom 2026-07-19
+// (Netzwerk-Stack eingefroren, KEIN Reset) zeigt sich ohnehin nicht über
+// reset_reason, sondern über den ausbleibenden Heartbeat ("Gerät still"-Alert).
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
@@ -79,6 +85,26 @@ inline bool           boot_done   = false;
 inline SemaphoreHandle_t udp_mtx  = nullptr;   // serialisiert UDP-Versand (WiFiUDP NICHT thread-safe!)
 inline char           name[SLOG_NAME_MAXLEN]  = "espresense-unnamed";
 inline bool           name_set = false;
+
+// ── Absturzkontext, der einen PANIC überlebt ────────────────────────────────
+// Eine Core-Dump-Partition hat diese Flotte nicht, und sie lässt sich auch
+// nicht nachrüsten: die Partitionstabelle liegt bei 0x8000 und wird von OTA
+// nicht angefasst - jeder Knoten bräuchte einen USB-Reflash (18 Stück, in 18
+// Räumen). RTC-Speicher mit NOINIT übersteht dagegen jeden Reset ausser dem
+// Stromausfall. Das liefert keinen Backtrace, aber die Antwort auf die Frage,
+// die nach einem Absturzschwarm zählt: WAS tat der Knoten, als er starb.
+// (Dasselbe Mittel hat 2026-06 bei maat die Absturzphase gezeigt.)
+// ⚠ NUR DEKLARIERT, definiert in src/slog_crash.cpp. `RTC_NOINIT_ATTR inline`
+// funktioniert NICHT: inline-Variablen landen als COMDAT im .bss, das
+// section-Attribut faellt still weg. Am fertigen Binary geprueft - die Symbole
+// lagen bei 0x3ffc… (DRAM, wird beim Boot genullt) statt im .rtc_noinit bei
+// 0x50000400. Der Absturzkontext waere bei jedem Reset spurlos verschwunden,
+// ohne dass irgendetwas gemeckert haette.
+#define SLOG_CRASH_MAGIC 0x5C0DE001u
+extern RTC_NOINIT_ATTR uint32_t crash_magic;
+extern RTC_NOINIT_ATTR char     crash_phase[24];
+extern RTC_NOINIT_ATTR char     crash_last[112];
+extern RTC_NOINIT_ATTR uint32_t crash_uptime;
 
 inline void hb_task(void *) {
     for (;;) {
@@ -161,6 +187,16 @@ inline void slog_init() {
     slog_detail::ensure_started();
 }
 
+// Aktuelle Phase vermerken - überlebt einen PANIC. Absichtlich das Billigste,
+// was geht (ein strncpy in RTC-RAM, kein Lock, keine Allokation): das darf auch
+// im BLE-Scan-Task und in MQTT-Callbacks stehen, ohne etwas zu kosten.
+inline void slog_phase(const char *p) {
+    if (!p) return;
+    strncpy(slog_detail::crash_phase, p, sizeof(slog_detail::crash_phase) - 1);
+    slog_detail::crash_phase[sizeof(slog_detail::crash_phase) - 1] = 0;
+    slog_detail::crash_uptime = (uint32_t)(millis() / 1000);
+}
+
 // Direkte strukturierte Lognachricht
 inline void slog(int sev, const char *fmt, ...) {
     if (WiFi.status() != WL_CONNECTED) return;
@@ -190,17 +226,45 @@ inline void slog(int sev, const char *fmt, ...) {
 }
 
 // Boot-Report: reset-Grund + Diagnose; error-Level bei abnormalem Reset.
-// (Kein Core-Dump-Backtrace hier - siehe Kommentar am Dateianfang.)
+// Bei abnormalem Reset zusätzlich der Absturzkontext aus dem RTC-Speicher
+// (siehe crash_* oben) - das ersetzt den fehlenden Core-Dump so weit es geht.
 inline void slog_boot() {
     slog_detail::boot_done = true;          // markiert Auto-Report als erledigt
     slog_detail::ensure_started();
     esp_reset_reason_t r = esp_reset_reason();
     bool abnormal = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT ||
                      r == ESP_RST_WDT || r == ESP_RST_BROWNOUT);
+
+    // Kontext AUSLESEN, bevor irgendetwas ihn überschreibt. Gültig nur, wenn die
+    // Marke steht - nach einem Stromausfall ist RTC-RAM Zufall, kein Zustand.
+    bool ctx_ok = (slog_detail::crash_magic == SLOG_CRASH_MAGIC);
+    char phase[sizeof(slog_detail::crash_phase)];
+    char last[sizeof(slog_detail::crash_last)];
+    uint32_t up = slog_detail::crash_uptime;
+    if (ctx_ok) {
+        memcpy(phase, slog_detail::crash_phase, sizeof(phase)); phase[sizeof(phase) - 1] = 0;
+        memcpy(last,  slog_detail::crash_last,  sizeof(last));  last[sizeof(last) - 1]  = 0;
+        for (char *c = phase; *c; ++c) if (*c < 32 || *c > 126) { *c = 0; break; }
+        for (char *c = last;  *c; ++c) if (*c < 32 || *c > 126) { *c = 0; break; }
+    }
+
     slog(abnormal ? SLOG_ERROR : SLOG_INFO,
          "boot reset=%s heap=%u minheap=%u ver=%s ip=%s rssi=%d",
          slog_detail::reset_str(r), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
          SLOG_FW_VERSION, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+
+    // Eigene Zeile, damit die bestehende Auswertung ("boot reset") unverändert
+    // greift und der Kontext trotzdem durchsuchbar ist ("crashctx").
+    if (abnormal && ctx_ok && phase[0])
+        slog(SLOG_ERROR, "crashctx phase=%s uptime=%lus last=\"%s\"",
+             phase, (unsigned long)up, last);
+
+    // Frisch aufsetzen: ab jetzt gilt der Kontext dieses Laufs.
+    slog_detail::crash_magic  = SLOG_CRASH_MAGIC;
+    slog_detail::crash_phase[0] = 0;
+    slog_detail::crash_last[0]  = 0;
+    slog_detail::crash_uptime = 0;
+    slog_phase("boot");
 }
 
 // Logger-Hook: Fragmente sammeln, vollständige Zeilen weiterleiten.
@@ -237,7 +301,15 @@ inline void slog_feed(const char *frag, size_t len) {
         if (ready) {
             const char *s = out;
             while (*s == ' ' || *s == '\t' || *s == '.') ++s;   // reine Punkt/Whitespace-Zeilen überspringen
-            if (*s) slog(slog_detail::guess_level(out), "%s", out);
+            if (*s) {
+                // Letzte vollständige Zeile in den absturzfesten Speicher. Vor dem
+                // Senden, nicht danach: stirbt der Knoten IM Sendepfad, ist genau
+                // diese Zeile die interessante.
+                strncpy(slog_detail::crash_last, s, sizeof(slog_detail::crash_last) - 1);
+                slog_detail::crash_last[sizeof(slog_detail::crash_last) - 1] = 0;
+                slog_detail::crash_uptime = (uint32_t)(millis() / 1000);
+                slog(slog_detail::guess_level(out), "%s", out);
+            }
         }
     }
 }

@@ -190,6 +190,7 @@ bool sendTelemetry(unsigned int totalSeen, unsigned int totalFpSeen, unsigned in
  * portal wait callback can also trigger a restart if the portal timeout elapses.
  */
 void setupNetwork() {
+    slog_phase("net-setup");
     Log.println("Setup network");
     WiFi.persistent(false);
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
@@ -348,6 +349,7 @@ void setupNetwork() {
 }
 
 void onMqttConnect(bool sessionPresent) {
+    slog_phase("mqtt-connected");
     xTimerStop(reconnectTimer, 0);
     mqttClient.subscribe("espresense/rooms/*/+/set", 1);
     mqttClient.subscribe(setTopic.c_str(), 1);
@@ -363,6 +365,7 @@ void onMqttConnect(bool sessionPresent) {
  * @param reason The MQTT client's disconnection reason code.
  */
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+    slog_phase("mqtt-disconnect");
     GUI::Connected(true, false);
     Log.printf("Disconnected from MQTT; reason %d\r\n", (int)reason);
     xTimerStart(reconnectTimer, 0);
@@ -387,6 +390,7 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
  * @param payload MQTT message payload string (null-terminated).
  */
 void onMqttMessage(const char *topic, const char *payload) {
+    slog_phase("mqtt-msg");
     String const top = String(topic);
     String pay = String(payload);
 
@@ -472,6 +476,7 @@ void onMqttMessageRaw(char *topic, char *payload, AsyncMqttClientMessageProperti
  * @param xTimer FreeRTOS timer handle associated with the reconnect timer (unused).
  */
 void reconnect(TimerHandle_t xTimer) {
+    slog_phase("mqtt-reconnect");
     Log.printf("%u Reconnect timer\r\n", xPortGetCoreID());
     if (MultiNetwork.isOnline() && mqttClient.connected()) return;
 
@@ -537,6 +542,7 @@ void reportLoop() {
     if (!mqttClient.connected()) {
         return;
     }
+    slog_phase("report");
 
     yield();
     auto fingerprintCount = BleFingerprintCollection::Size();
@@ -591,6 +597,7 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 void scanTask(void *parameter) {
+    slog_phase("ble-scan-init");
     esp_task_wdt_add(NULL);  // register this task too - a wedged NimBLE scan shouldn't go unnoticed either
     NimBLEDevice::init("ESPresense");
     NimBLEDevice::deleteAllBonds();
