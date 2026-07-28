@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 
 #include "HeadlessWiFiSettings.h"
 #include "GUI.h"
@@ -116,6 +117,17 @@ void firmwareUpdate() {
     });
 
     httpUpdate.onProgress([](int progress, int total) {
+        // Der Download blockiert die loop()-Task, und genau die haengt am
+        // Task-Watchdog (TASK_WDT_TIMEOUT_MS = 60 s in main.cpp). Ohne diesen
+        // Reset schiesst der Watchdog jedes Update ab, das laenger als eine
+        // Minute braucht - und weil jeder Wiederholungsversuch an derselben
+        // Stelle stirbt, kommt der Knoten aus der Schleife nicht mehr heraus.
+        // Am 2026-07-28 beim Flotten-Rollout passiert: 16 Knoten waren schnell
+        // genug, 'floor' und 'laboratory_2' nicht (bei ~10 % nach 27 s haetten
+        // sie 4,5 min gebraucht) - beide starteten danach im Minutentakt neu.
+        // Der Schutz bleibt vollstaendig: bleibt der Download stehen, kommt
+        // kein onProgress mehr und der Watchdog greift wie vorgesehen.
+        esp_task_wdt_reset();
         int percentage = total > 0 ? (progress * 100) / total : 0;
         GUI::Update(percentage);
     });
@@ -186,6 +198,7 @@ void configureOTA(void) {
             HttpWebServer::UpdateEnd();
         })
         .onProgress([](unsigned int progress, unsigned int total) {
+            esp_task_wdt_reset();   // gleiche Falle wie beim HTTP-Update, s.o.
             GUI::Update((progress / (total / 100)));
         })
         .onError([](ota_error_t error) {
