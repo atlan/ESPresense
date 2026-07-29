@@ -475,6 +475,41 @@ void onMqttMessageRaw(char *topic, char *payload, AsyncMqttClientMessageProperti
  *
  * @param xTimer FreeRTOS timer handle associated with the reconnect timer (unused).
  */
+// ★★★ Neustart ENTZERRT, damit nicht die ganze Flotte gleichzeitig zurueckkommt.
+//
+// Ein kurzer Netzausfall laesst JEDEN Knoten hier landen, und alle etwa gleichzeitig — am
+// 29.07.2026 nach einem UDM-Firmware-Update 14 Knoten binnen 40 Sekunden (belegt durch
+// "crashctx phase=net-setup"). Das Neustarten selbst ist beabsichtigt und harmlos.
+//
+// ⚠ Gefaehrlich ist die GLEICHZEITIGKEIT: jede MQTT-Anmeldung wird gegen HAs API geprueft.
+// Am 28.07.2026 hat ein solcher Anmeldesturm Mosquitto ueberfahren und die halbe Flotte in
+// eine Absturzkaskade gezogen — das eigentliche Problem war nie der einzelne Knoten.
+//
+// Die Wartezeit kostet nichts: der Knoten ist zu diesem Zeitpunkt ohnehin schon ~40 s offline,
+// und er wuerde die naechsten Sekunden mit Booten verbringen. Der Zufallswert kommt aus der
+// MAC, damit jeder Knoten seinen EIGENEN Versatz hat und ihn ueber Neustarts behaelt (ein
+// esp_random()-Wert waere bei allen gleich verteilt, aber zwei Knoten koennten wiederholt
+// denselben ziehen).
+// Bis zu 30 s. Bei 18 Knoten liegen die Anmeldungen damit im Mittel 1,7 s auseinander statt
+// alle in derselben Sekunde; Mosquitto und HAs Auth-Pruefung kommen dabei muehelos mit.
+static const uint32_t STAGGER_MAX_MS = 30000;
+
+static void staggered_restart(const char *grund) {
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    // ⚠ NICHT einfach die letzten zwei MAC-Bytes nehmen. Geraete aus einer Charge haben oft
+    // fortlaufende Adressen; der Versatz laege dann in festen Schritten (bei 18 Knoten nur
+    // ~4,6 s Spanne statt 30 s) — also genau die Gleichzeitigkeit, die vermieden werden soll.
+    // FNV-1a ueber ALLE sechs Bytes streut unabhaengig davon, wie die Adressen vergeben wurden.
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) { h ^= mac[i]; h *= 16777619u; }
+    uint32_t versatz_ms = h % (STAGGER_MAX_MS + 1);
+    slog(SLOG_WARN, "restart in %ums (%s) - entzerrt, damit die Flotte nicht gleichzeitig zurueckkommt",
+         (unsigned)versatz_ms, grund);
+    delay(versatz_ms);
+    ESP.restart();
+}
+
 void reconnect(TimerHandle_t xTimer) {
     slog_phase("mqtt-reconnect");
     Log.printf("%u Reconnect timer\r\n", xPortGetCoreID());
@@ -482,14 +517,14 @@ void reconnect(TimerHandle_t xTimer) {
 
     if (reconnectTries++ > 50) {
         Log.println("Too many reconnect attempts; Restarting");
-        ESP.restart();
+        staggered_restart("zu viele Reconnect-Versuche");
     }
 
     if (!MultiNetwork.isOnline()) {
         Log.printf("%u Reconnecting to Network...\r\n", xPortGetCoreID());
 
         if (!MultiNetwork.connect(ethernetType, 2, 40, HeadlessWiFiSettings.hostname.c_str()))
-            ESP.restart();
+            staggered_restart("Netz nicht wiederhergestellt");
     }
 
     Log.printf("%u Reconnecting to MQTT...\r\n", xPortGetCoreID());
