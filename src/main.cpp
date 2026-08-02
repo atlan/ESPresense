@@ -190,7 +190,19 @@ bool sendTelemetry(unsigned int totalSeen, unsigned int totalFpSeen, unsigned in
  * portal wait callback can also trigger a restart if the portal timeout elapses.
  */
 void setupNetwork() {
-    slog_phase("net-setup");
+    // ★★ Feinere Phasenmarken statt eines einzigen "net-setup".
+    //
+    // Warum: am 03.08.2026 in seshat ausgewertet — ALLE 69 Absturzkontexte der Flotte
+    // meldeten `phase=net-setup uptime=0s`, 49 PANICs in 14 Tagen ueber 17 Knoten. Der
+    // Merker war dabei nicht veraltet (RTC-Symbole am ELF geprueft: 0x50000400), sondern
+    // schlicht zu grob: er deckte diese GANZE Funktion ab — Einstellungen, rund zwanzig
+    // ConnectToWifi()-Aufrufe der Untersysteme, den eigentlichen Verbindungsaufbau.
+    //
+    // ⚠ Erschwerend: `slog_init()`/`slog_boot()` stehen am ENDE dieser Funktion. Alles
+    // davor geht nur ans lokale Serial — ein Absturz hier hinterlaesst in seshat KEINE
+    // Spur ausser der Phase beim naechsten Start. Die Marke ist also die einzige
+    // Information, die wir ueberhaupt bekommen; sie muss etwas taugen.
+    slog_phase("net-cfg");
     Log.println("Setup network");
     WiFi.persistent(false);
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
@@ -219,6 +231,7 @@ void setupNetwork() {
 
     bool updating = SPIFFS.exists("/update");
 
+    slog_phase("net-subsys");
     Updater::ConnectToWifi(updating);
 
     // Mark endpoint boundary: settings registered after this belong to /wifi/extras endpoint
@@ -276,8 +289,10 @@ void setupNetwork() {
     HeadlessWiFiSettings.onHttpSetup = HttpWebServer::Init;
     HeadlessWiFiSettings.hostname = "espresense-" + kebabify(room);
 
+    slog_phase("net-connect");
     if (!MultiNetwork.connect(ethernetType, 20, wifiTimeout, HeadlessWiFiSettings.hostname.c_str()))
         ESP.restart();
+    slog_phase("net-up");
 
     GUI::Connected(true, false);
 
@@ -337,7 +352,9 @@ void setupNetwork() {
     // Zeile (WiFi-Verbindungsaufbau etc.) geht nur ans lokale Serial.
     slog_set_name(id.c_str());
     slog_init();
-    slog_boot();
+    slog_boot();          // setzt selbst phase="boot"
+    slog_phase("run");    // ab hier ist der Start durch — Laufzeitabstuerze sind
+                          // damit von Startabstuerzen unterscheidbar
 
     roomsTopic = CHANNEL + String("/rooms/") + id;
     statusTopic = roomsTopic + "/status";
