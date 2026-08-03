@@ -12,8 +12,10 @@
 #include "slog.h"
 
 namespace slog_detail {
-RTC_NOINIT_ATTR uint32_t crash_magic;
-RTC_NOINIT_ATTR char     crash_phase[24];
-RTC_NOINIT_ATTR char     crash_last[112];
-RTC_NOINIT_ATTR uint32_t crash_uptime;
+RTC_NOINIT_ATTR uint32_t     crash_magic;
+RTC_NOINIT_ATTR char         crash_phase[24];
+RTC_NOINIT_ATTR uint32_t     crash_phase_at;
+RTC_NOINIT_ATTR uint32_t     crash_last_at;
+RTC_NOINIT_ATTR uint32_t     crash_ring_seq;
+RTC_NOINIT_ATTR crash_line_t crash_ring[SLOG_CRASH_RING_N];
 }

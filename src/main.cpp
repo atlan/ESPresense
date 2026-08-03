@@ -205,10 +205,11 @@ void setupNetwork() {
     // schlicht zu grob: er deckte diese GANZE Funktion ab — Einstellungen, rund zwanzig
     // ConnectToWifi()-Aufrufe der Untersysteme, den eigentlichen Verbindungsaufbau.
     //
-    // ⚠ Erschwerend: `slog_init()`/`slog_boot()` stehen am ENDE dieser Funktion. Alles
-    // davor geht nur ans lokale Serial — ein Absturz hier hinterlaesst in seshat KEINE
-    // Spur ausser der Phase beim naechsten Start. Die Marke ist also die einzige
-    // Information, die wir ueberhaupt bekommen; sie muss etwas taugen.
+    // ⚠ Erschwerend war, dass `slog_init()`/`slog_boot()` am ENDE dieser Funktion
+    // standen — alles davor ging nur ans lokale Serial. Seit dem 03.08.2026 startet
+    // slog direkt nach `net-up`, und der Name steht schon nach dem Lesen von `room`;
+    // Zeilen aus dem Verbindungsaufbau landen dadurch wenigstens im Absturz-Ring,
+    // auch wenn sie mangels WLAN nicht gesendet werden koennen.
     slog_phase("net-cfg");
     Log.println("Setup network");
     WiFi.persistent(false);
@@ -216,6 +217,14 @@ void setupNetwork() {
     GUI::Connected(false, false);
 
     room = HeadlessWiFiSettings.string("room", ESPMAC, "Room");
+
+    // ★ Node-Identitaet SO FRUEH WIE MOEGLICH setzen — sie ist genau hier zum
+    // ersten Mal bekannt. slog_feed() verwirft alles, solange kein Name steht;
+    // ab dieser Zeile landen Logzeilen im absturzfesten Ring, auch wenn noch
+    // gar kein WLAN steht und nichts gesendet werden kann. Genau die Zeilen aus
+    // dem Verbindungsaufbau haben bisher gefehlt.
+    id = slugify(room);
+    slog_set_name(id.c_str());
     HeadlessWiFiSettings.string("wifi-ssid", "", "WiFi SSID");
     HeadlessWiFiSettings.pstring("wifi-password", "", "WiFi Password");
     auto wifiTimeout = HeadlessWiFiSettings.integer("wifi_timeout", DEFAULT_WIFI_TIMEOUT, "Seconds to wait for WiFi before captive portal (-1 = forever)");
@@ -301,6 +310,16 @@ void setupNetwork() {
         ESP.restart();
     slog_phase("net-up");
 
+    // ★★ slog startet HIER, nicht mehr am Ende dieser Funktion. Frueher geht es
+    // nicht (der Versand braucht WLAN), spaeter darf es nicht: dazwischen liegen
+    // rund vierzig Log-Zeilen (Firmware, IP, Room, Sensor-Reports), die bis zum
+    // 03.08.2026 NUR ans lokale Serial gingen. Ein Absturz in diesem Block war
+    // in seshat komplett unsichtbar — und genau dort lag der PANIC von `floor`
+    // an dem Tag (phase=net-up, Absturz vor dem ersten gesendeten Byte).
+    slog_init();
+    slog_boot();               // meldet den Absturzkontext des VORIGEN Laufs
+    slog_phase("net-report");
+
     GUI::Connected(true, false);
 
 #ifdef FIRMWARE
@@ -352,16 +371,8 @@ void setupNetwork() {
     Log.println(BleFingerprintCollection::countIds);
 
     localIp = MultiNetwork.localIP().toString();
-    id = slugify(room);
-
-    // Zentrales Logging (seshat/Loki) - erst ab hier ist die Node-Identitaet
-    // bekannt (Laufzeit-Fleet, siehe Kommentar in slog.h). Alles vor dieser
-    // Zeile (WiFi-Verbindungsaufbau etc.) geht nur ans lokale Serial.
-    slog_set_name(id.c_str());
-    slog_init();
-    slog_boot();          // setzt selbst phase="boot"
-    slog_phase("run");    // ab hier ist der Start durch — Laufzeitabstuerze sind
-                          // damit von Startabstuerzen unterscheidbar
+    // ⚠ `id` und slog stehen jetzt weiter oben (siehe dort) — hier bleibt nur
+    // das, was die fertige Verbindung wirklich braucht.
 
     roomsTopic = CHANNEL + String("/rooms/") + id;
     statusTopic = roomsTopic + "/status";
@@ -370,6 +381,7 @@ void setupNetwork() {
     configTopic = CHANNEL + String("/settings/+/config");
     HeadlessWiFiSettings.httpSetup();
     Updater::MarkOtaSuccess();
+    slog_phase("net-done");
 }
 
 void onMqttConnect(bool sessionPresent) {
@@ -715,6 +727,10 @@ void scanTask(void *parameter) {
  * starts the BLE scan task, and performs MQTT/reporting setup.
  */
 void setup() {
+    // ★★ MUSS die erste Anweisung bleiben: rettet den Absturzkontext des vorigen
+    // Laufs nach DRAM und setzt den RTC-Block sofort fuer diesen Lauf neu auf.
+    // Alles, was danach kommt, darf ihn ueberschreiben — vorher darf es niemand.
+    slog_crash_capture();
 #ifdef FAST_MONITOR
     Serial.begin(1500000);
 #else
@@ -768,6 +784,8 @@ void setup() {
     esp_task_wdt_reset();
     Log.printf("Post-Setup Free Mem: %lu\r\n", static_cast<unsigned long>(ESP.getFreeHeap()));
     Log.println();
+    slog_phase("run");    // ab hier ist der Start KOMPLETT durch — Laufzeitabstuerze
+                          // sind damit von Startabstuerzen unterscheidbar
 }
 
 /**
