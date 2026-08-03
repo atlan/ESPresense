@@ -6,6 +6,13 @@
 #include "esp_task_wdt.h"
 #include "slog.h"
 
+// esp_read_mac()/ESP_MAC_WIFI_STA (genutzt in staggered_restart) wanderten mit IDF 5.0 aus
+// esp_system.h in einen eigenen Header. Unter IDF 4.x (tasmota-Plattform: esp32, esp32c3) gibt
+// es esp_mac.h noch nicht, dort kommen beide weiterhin ueber main.h/esp_system.h herein.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "esp_mac.h"
+#endif
+
 
 void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *functionName)
 {
