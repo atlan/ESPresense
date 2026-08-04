@@ -93,6 +93,16 @@ inline bool           boot_done   = false;
 inline SemaphoreHandle_t udp_mtx  = nullptr;   // serialisiert UDP-Versand (WiFiUDP NICHT thread-safe!)
 inline char           name[SLOG_NAME_MAXLEN]  = "espresense-unnamed";
 inline bool           name_set = false;
+// Fehlgeschlagene UDP-Sendungen seit dem Start. Steht im Heartbeat, damit
+// "Zeile fehlt" von "Zeile nie geschrieben" unterscheidbar wird.
+inline volatile uint32_t tx_fail = 0;
+// Pause zwischen den nachgereichten crashtail-Zeilen. Am 03.08.2026 kamen von acht
+// Zeilen nur 1 bzw. 2 bzw. 5 an. Gegenprobe vom Mac: derselbe Schwall erreicht Loki
+// vollstaendig, die Sammelstelle ist also unschuldig — es ist der Knoten, der sie
+// unmittelbar nach dem WLAN-Aufbau nicht alle los wird.
+#ifndef SLOG_CRASHTAIL_GAP_MS
+#define SLOG_CRASHTAIL_GAP_MS 40
+#endif
 
 // ── Absturzkontext, der einen PANIC überlebt ────────────────────────────────
 // Eine Core-Dump-Partition hat diese Flotte nicht, und sie lässt sich auch
@@ -161,14 +171,15 @@ inline void hb_task(void *) {
         vTaskDelay(pdMS_TO_TICKS(SLOG_HEARTBEAT_MS));
         if (WiFi.status() == WL_CONNECTED)
             // Einheitliches Fleet-Heartbeat-Schema (siehe arkon-infra/esp/STANDARDS.md).
-            slog(SLOG_DEBUG, "heartbeat uptime=%lus free_int=%u free_ext=%u min_int=%u rssi=%d ip=%s ver=%s",
+            slog(SLOG_DEBUG, "heartbeat uptime=%lus free_int=%u free_ext=%u min_int=%u rssi=%d ip=%s ver=%s txfail=%lu",
                  (unsigned long)(millis() / 1000),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
                  (int)WiFi.RSSI(),
                  WiFi.localIP().toString().c_str(),
-                 SLOG_FW_VERSION);
+                 SLOG_FW_VERSION,
+                 (unsigned long)tx_fail);
     }
 }
 
@@ -319,9 +330,14 @@ inline void slog(int sev, const char *fmt, ...) {
                      pri, slog_detail::name, SLOG_APP, slog_detail::name, slog_detail::lvlword(sev), msg);
     if (n > 0) {
         if (n > (int)sizeof(pkt)) n = sizeof(pkt);
-        slog_detail::udp.beginPacket(SLOG_HOST, SLOG_PORT);
-        slog_detail::udp.write((const uint8_t *)pkt, n);
-        slog_detail::udp.endPacket();
+        // ★ Rueckgabewerte AUSWERTEN. Bis 04.08.2026 wurden sie verworfen — ein
+        // fehlgeschlagener Versand war damit von "nie geschrieben" nicht zu
+        // unterscheiden, und genau diese Frage stand bei den verlorenen
+        // crashtail-Zeilen im Raum. Der Zaehler geht in den Heartbeat.
+        bool ok = slog_detail::udp.beginPacket(SLOG_HOST, SLOG_PORT) == 1;
+        if (ok) ok = slog_detail::udp.write((const uint8_t *)pkt, n) == (size_t)n;
+        if (ok) ok = slog_detail::udp.endPacket() == 1;
+        if (!ok) slog_detail::tx_fail++;
     }
     xSemaphoreGive(slog_detail::udp_mtx);
 }
@@ -362,6 +378,10 @@ inline void slog_boot() {
     for (uint32_t i = 0; i < slog_detail::snap_n; ++i) {
         char *t = slog_detail::snap_ring[i].txt;
         if (!t[0]) continue;
+        // ⚠ Entzerren, sonst geht der groesste Teil verloren (siehe SLOG_CRASHTAIL_GAP_MS).
+        // Der Preis ist eine Drittelsekunde beim Start; der Absturzkontext ist genau die
+        // Information, an der man nicht sparen will. Weit unter dem 60-s-Watchdog.
+        if (i) delay(SLOG_CRASHTAIL_GAP_MS);
         // ⚠ seshat-alert.py zaehlt Reboots ueber das Vorkommen von "boot reset=".
         // Eine nachgereichte Zeile darf diese Zaehlung nicht faelschen.
         if (char *p = strstr(t, "boot reset")) p[4] = '-';
