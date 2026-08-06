@@ -18,4 +18,8 @@ RTC_NOINIT_ATTR uint32_t     crash_phase_at;
 RTC_NOINIT_ATTR uint32_t     crash_last_at;
 RTC_NOINIT_ATTR uint32_t     crash_ring_seq;
 RTC_NOINIT_ATTR crash_line_t crash_ring[SLOG_CRASH_RING_N];
+RTC_NOINIT_ATTR char         crash_item[40];
+RTC_NOINIT_ATTR uint32_t     crash_item_at;
+RTC_NOINIT_ATTR uint8_t      crash_seen_addr[6];
+RTC_NOINIT_ATTR uint32_t     crash_seen_at;
 }

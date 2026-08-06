@@ -613,7 +613,10 @@ void reportLoop() {
     if (!mqttClient.connected()) {
         return;
     }
-    slog_phase("report");
+    // ★ Feinere Marken statt eines pauschalen "report": bei zehn Abstuerzen am
+    // 06.08.2026 stand achtmal `phase=report` — das umfasst aber Zaehlschleife,
+    // Telemetrie UND Meldeschleife. Welche davon, sagte es nicht.
+    slog_phase("rep-count");
 
     yield();
     auto fingerprintCount = BleFingerprintCollection::Size();
@@ -629,13 +632,17 @@ void reportLoop() {
     GUI::Count(count);
 
     yield();
+    slog_phase("rep-tele");
     sendTelemetry(totalSeen, totalFpSeen, totalFpQueried, totalFpReported, count, fingerprintCount);
     yield();
 
+    slog_phase("rep-dev");
     auto reported = 0;
     cursor = 0;
     while (auto lease = BleFingerprintCollection::AcquireNext(cursor, false)) {
         auto *f = lease.fingerprint;
+        // Welches Geraet gerade dran ist — ueberlebt den PANIC im RTC-Block.
+        slog_item(f->getId().c_str());
         auto seen = f->getSeenCount();
         if (seen) {
             totalSeen += seen;
@@ -663,6 +670,12 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice *advertisedDevice) {
 #endif
         bleStack = uxTaskGetStackHighWaterMark(nullptr);
+        // ★ Eigene Marke fuer DIESEN Task. slog_phase() gehoert der Hauptschleife;
+        // stirbt der Knoten hier, sagte der Kontext bisher trotzdem "report".
+        // Rohe Bytes, keine Zeichenkette — dieser Rueckruf feuert bei jeder
+        // Aussendung, eine Allokation waere hier zu teuer und wuerde ausserdem
+        // genau das veraendern, was gemessen werden soll.
+        slog_seen(advertisedDevice->getAddress().getNative());
         BleFingerprintCollection::Seen(advertisedDevice);
     }
 };

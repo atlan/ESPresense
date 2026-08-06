@@ -123,8 +123,9 @@ inline volatile uint32_t tx_fail = 0;
 // und RTC-NOINIT ueberlebt genau das: die neue Firmware findet den RTC-Block der
 // ALTEN vor. Bei gleicher Marke wuerde sie fremde Bytes nach neuem Layout deuten
 // und einen frei erfundenen Absturzkontext melden. 002 = Ringpuffer + zwei
-// getrennte Zeitstempel (03.08.2026).
-#define SLOG_CRASH_MAGIC 0x5C0DE002u
+// getrennte Zeitstempel (03.08.2026). 003 = je Task eine Marke, crash_item +
+// crash_seen (06.08.2026).
+#define SLOG_CRASH_MAGIC 0x5C0DE003u
 
 // Wie viele der letzten Logzeilen einen PANIC ueberleben sollen.
 // ⚠ Kostet RTC-NOINIT *und* dieselbe Menge DRAM (die Kopie, siehe snap_* unten).
@@ -150,6 +151,24 @@ extern RTC_NOINIT_ATTR uint32_t     crash_last_at;    // letzte Zeile geschriebe
 extern RTC_NOINIT_ATTR uint32_t     crash_ring_seq;   // Schreibzaehler, nie zurueckgesetzt
 extern RTC_NOINIT_ATTR crash_line_t crash_ring[SLOG_CRASH_RING_N];
 
+// ★★ ZWEI Marken statt einer Phase — je Task eine, und das ist der Punkt.
+// `slog_phase()` wird von der HAUPTSCHLEIFE gesetzt. Das BLE-Auswerten laeuft aber
+// in scanTask. Stirbt der Knoten dort, meldet der Kontext trotzdem die Phase der
+// Hauptschleife — am 06.08.2026 stand bei acht von zehn Abstuerzen `phase=report`,
+// was den Verdacht auf den Meldepfad lenkte, OHNE dass das belegt gewesen waere.
+// Seither traegt jeder Task seine eigene Marke, und beide werden gemeldet:
+//   crash_item  — Hauptschleife: welches Geraet gerade gemeldet wurde
+//   crash_seen  — scanTask: welche Aussendung zuletzt hereinkam
+// Ist eine der beiden alt (grosser Abstand zum Absturz), war dieser Task nicht
+// beteiligt. Das ist die Frage, die der Kontext bisher nicht beantworten konnte.
+extern RTC_NOINIT_ATTR char         crash_item[40];   // Hauptschleife
+extern RTC_NOINIT_ATTR uint32_t     crash_item_at;
+// ⚠ ROHE Bytes, keine Zeichenkette: das hier steht im Scan-Rueckruf, der bei jeder
+// Aussendung feuert. `toString()` allokiert — eine Allokation im heissesten Pfad
+// genau vor dem vermuteten Absturz wuerde das veraendern, was sie messen soll.
+extern RTC_NOINIT_ATTR uint8_t      crash_seen_addr[6];
+extern RTC_NOINIT_ATTR uint32_t     crash_seen_at;
+
 // ── Kopie im DRAM ───────────────────────────────────────────────────────────
 // ★★ WARUM eine Kopie: bis 03.08.2026 raeumte erst `slog_boot()` den RTC-Block
 // auf — die Funktion also, die bei einem fruehen Absturz gar nicht mehr laeuft.
@@ -165,6 +184,10 @@ inline uint32_t     snap_phase_at = 0;
 inline uint32_t     snap_last_at  = 0;
 inline uint32_t     snap_n = 0;                        // gueltige Eintraege, alt → neu
 inline crash_line_t snap_ring[SLOG_CRASH_RING_N] = {};
+inline char         snap_item[40] = {0};
+inline uint32_t     snap_item_at = 0;
+inline uint8_t      snap_seen_addr[6] = {0};
+inline uint32_t     snap_seen_at = 0;
 
 inline void hb_task(void *) {
     for (;;) {
@@ -258,6 +281,26 @@ inline void slog_phase(const char *p) {
     slog_detail::crash_phase_at = (uint32_t)(millis() / 1000);
 }
 
+// Welches Geraet die HAUPTSCHLEIFE gerade bearbeitet. Gleiche Kosten wie
+// slog_phase(): ein strncpy in RTC-RAM, kein Lock, keine Allokation.
+inline void slog_item(const char *s) {
+    if (!s) return;
+    strncpy(slog_detail::crash_item, s, sizeof(slog_detail::crash_item) - 1);
+    slog_detail::crash_item[sizeof(slog_detail::crash_item) - 1] = 0;
+    slog_detail::crash_item_at = (uint32_t)(millis() / 1000);
+}
+
+// Welche Aussendung der SCAN-TASK zuletzt hereinbekommen hat.
+// ⚠ Erwartet die 6 rohen Bytes, wie NimBLE sie haelt (LITTLE ENDIAN — addr[0] ist
+// das Byte, das in der ueblichen Schreibweise ZULETZT steht). Gedreht wird erst
+// beim Melden, siehe slog_boot(). Wer hier schon dreht, jagt spaeter die falsche
+// Adresse.
+inline void slog_seen(const uint8_t *addr6) {
+    if (!addr6) return;
+    memcpy(slog_detail::crash_seen_addr, addr6, 6);
+    slog_detail::crash_seen_at = (uint32_t)(millis() / 1000);
+}
+
 // Text aus dem RTC-Speicher saeubern: nach einem Stromausfall steht dort Zufall,
 // und ein abgeschnittener strncpy kann mitten in einem Zeichen enden. Ab dem
 // ersten nicht druckbaren Byte wird abgeschnitten.
@@ -295,6 +338,13 @@ inline void slog_crash_capture() {
             slog_sanitize(slog_detail::snap_ring[i].txt);
         }
         slog_detail::snap_n = n;
+
+        memcpy(slog_detail::snap_item, slog_detail::crash_item, sizeof(slog_detail::snap_item));
+        slog_detail::snap_item[sizeof(slog_detail::snap_item) - 1] = 0;
+        slog_sanitize(slog_detail::snap_item);
+        slog_detail::snap_item_at = slog_detail::crash_item_at;
+        memcpy(slog_detail::snap_seen_addr, slog_detail::crash_seen_addr, 6);
+        slog_detail::snap_seen_at = slog_detail::crash_seen_at;
     }
 
     slog_detail::crash_magic    = SLOG_CRASH_MAGIC;
@@ -302,6 +352,10 @@ inline void slog_crash_capture() {
     slog_detail::crash_phase_at = 0;
     slog_detail::crash_last_at  = 0;
     slog_detail::crash_ring_seq = 0;
+    slog_detail::crash_item[0]  = 0;
+    slog_detail::crash_item_at  = 0;
+    memset(slog_detail::crash_seen_addr, 0, 6);
+    slog_detail::crash_seen_at  = 0;
     for (uint32_t i = 0; i < SLOG_CRASH_RING_N; ++i) {
         slog_detail::crash_ring[i].at     = 0;
         slog_detail::crash_ring[i].txt[0] = 0;
@@ -342,6 +396,14 @@ inline void slog(int sev, const char *fmt, ...) {
     xSemaphoreGive(slog_detail::udp_mtx);
 }
 
+// Adresse in der ueblichen Schreibweise. Siehe Warnung bei slog_seen(): NimBLE
+// haelt sie little-endian, gedruckt wird [5]..[0].
+inline String Sprintf_slogaddr(const uint8_t *a) {
+    char b[13];
+    snprintf(b, sizeof(b), "%02x%02x%02x%02x%02x%02x", a[5], a[4], a[3], a[2], a[1], a[0]);
+    return String(b);
+}
+
 // Boot-Report: reset-Grund + Diagnose; error-Level bei abnormalem Reset.
 // Bei abnormalem Reset zusätzlich der Absturzkontext - das ersetzt den fehlenden
 // Core-Dump so weit es geht. Gemeldet wird aus der DRAM-Kopie (slog_crash_capture),
@@ -370,6 +432,30 @@ inline void slog_boot() {
         slog(SLOG_ERROR, "crashctx phase=%s phase_at=%lus last_at=%lus last=\"%s\"",
              slog_detail::snap_phase, (unsigned long)slog_detail::snap_phase_at,
              (unsigned long)slog_detail::snap_last_at, last);
+
+    // ★ Die beiden Task-Marken. Eigene Zeile: die crashctx-Zeile traegt schon bis zu
+    // 108 Zeichen `last=` und das slog-Paket ist 300 Bytes gross — das wuerde knapp.
+    // `*_ago` ist die Angabe, auf die es ankommt: welcher Task war ZULETZT aktiv.
+    // Eine Marke, die Minuten alt ist, gehoert nicht zum Absturz.
+    {
+        uint32_t bezug = slog_detail::snap_last_at > slog_detail::snap_phase_at
+                       ? slog_detail::snap_last_at : slog_detail::snap_phase_at;
+        if (slog_detail::snap_item_at > bezug) bezug = slog_detail::snap_item_at;
+        if (slog_detail::snap_seen_at > bezug) bezug = slog_detail::snap_seen_at;
+        const uint8_t *a = slog_detail::snap_seen_addr;
+        bool seen_gesetzt = slog_detail::snap_seen_at || a[0] || a[1] || a[2] || a[3] || a[4] || a[5];
+        // ⚠ Rueckwaerts formatiert — NimBLE haelt die Adresse little-endian, und
+        // toString() gibt [5]..[0] aus. Wer hier vorwaerts schreibt, sucht spaeter
+        // ein Geraet, das es nicht gibt.
+        slog(SLOG_ERROR,
+             "crashwhat item=\"%s\" item_at=%lus (vor %lus) seen=%s seen_at=%lus (vor %lus)",
+             slog_detail::snap_item[0] ? slog_detail::snap_item : "-",
+             (unsigned long)slog_detail::snap_item_at,
+             (unsigned long)(bezug - slog_detail::snap_item_at),
+             seen_gesetzt ? Sprintf_slogaddr(a).c_str() : "-",
+             (unsigned long)slog_detail::snap_seen_at,
+             (unsigned long)(bezug - slog_detail::snap_seen_at));
+    }
 
     // Die letzten Zeilen vor dem Absturz nachreichen, alt → neu. Sie sind der
     // eigentliche Grund fuer den Ring: slog() verwirft alles, solange kein WLAN
