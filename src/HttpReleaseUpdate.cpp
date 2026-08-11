@@ -4,6 +4,7 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include "Logger.h"
+#include "esp_task_wdt.h"
 
 /**
  * @brief Performs an OTA update by fetching the firmware from the given URL using the provided WiFi client.
@@ -201,6 +202,36 @@ bool HttpReleaseUpdate::runUpdate(Stream& in, uint32_t size) {
 
     if (_cbProgress) {
         _cbProgress(0, size);
+    }
+
+    // ★★ Auf das erste Byte warten, BEVOR writeStream() drangeht.
+    //
+    // `Update.writeStream()` beginnt mit `peek()`. Liegt noch nichts an, liefert
+    // peek() -1, und die Update-Klasse meldet **"Wrong Magic Byte"** — es sieht nach
+    // einer kaputten Datei aus, ist aber ein Wettlauf mit dem Server.
+    //
+    // Am 11.08.2026 am Knoten `office` gemessen, dieselbe Datei zweimal:
+    //     kalt (nicht im Seitenpuffer des Servers) -> Wrong Magic Byte, Abbruch bei 0 %
+    //     warm                                     -> completed successfully
+    // Gegenprobe mit dem ALTEN, nachweislich guten Abbild: kalt ebenfalls Fehler.
+    // Es lag also nie an der Datei. Der Rollout hat das bis dahin umschifft, indem er
+    // die Datei vorher einmal ganz las (arkon-infra 74972e0) — das behebt es aber nur
+    // fuer den eigenen Server, nicht fuer GitHub oder einen langsamen Spiegel.
+    //
+    // Der Watchdog wird dabei gefuettert: bis hierher hat `Update.begin()` schon die
+    // Partition geloescht, und die Wartezeit kommt oben drauf.
+    {
+        const uint32_t beginn = millis();
+        while (!in.available() && millis() - beginn < 10000) {
+            esp_task_wdt_reset();
+            delay(10);
+        }
+        if (!in.available()) {
+            Log.printf("Keine Daten binnen 10 s — Update abgebrochen\r\n");
+            _lastError = HTTP_UE_NO_DATA;
+            Update.abort();
+            return false;
+        }
     }
 
     if (Update.writeStream(in) != size) {

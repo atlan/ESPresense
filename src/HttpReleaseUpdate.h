@@ -16,6 +16,10 @@
 #define HTTP_UE_SERVER_FAULTY_MD5 (-105)
 #define HTTP_UE_BIN_VERIFY_HEADER_FAILED (-106)
 #define HTTP_UE_BIN_FOR_WRONG_FLASH (-107)
+// Der Server hat zwar geantwortet, aber binnen der Wartezeit kam kein Nutzbyte.
+// Frueher landete genau dieser Fall als "Wrong Magic Byte" im Log — siehe
+// HttpReleaseUpdate.cpp, runUpdate().
+#define HTTP_UE_NO_DATA (-108)
 #define HTTP_UE_NO_PARTITION (-108)
 
 enum HttpUpdateResult {
