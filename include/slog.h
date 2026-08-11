@@ -124,8 +124,8 @@ inline volatile uint32_t tx_fail = 0;
 // ALTEN vor. Bei gleicher Marke wuerde sie fremde Bytes nach neuem Layout deuten
 // und einen frei erfundenen Absturzkontext melden. 002 = Ringpuffer + zwei
 // getrennte Zeitstempel (03.08.2026). 003 = je Task eine Marke, crash_item +
-// crash_seen (06.08.2026).
-#define SLOG_CRASH_MAGIC 0x5C0DE003u
+// crash_seen (06.08.2026). 004 = Speicherstand im Kontext (11.08.2026).
+#define SLOG_CRASH_MAGIC 0x5C0DE004u
 
 // Wie viele der letzten Logzeilen einen PANIC ueberleben sollen.
 // ⚠ Kostet RTC-NOINIT *und* dieselbe Menge DRAM (die Kopie, siehe snap_* unten).
@@ -169,6 +169,16 @@ extern RTC_NOINIT_ATTR uint32_t     crash_item_at;
 extern RTC_NOINIT_ATTR uint8_t      crash_seen_addr[6];
 extern RTC_NOINIT_ATTR uint32_t     crash_seen_at;
 
+// ★★ Der Speicherstand im Absturzkontext (11.08.2026).
+// Bis hierher trug der Kontext Phase und Element, aber keine Zahl zum Heap — und
+// der `minheap` aus dem Boot-Bericht ist der Stand NACH dem Neustart, taugt also
+// fuer die Frage nichts. Ohne diese Felder bleibt "Absturz unter Speicherdruck"
+// eine Vermutung; mit ihnen steht beim naechsten Mal eine Zahl da.
+// Interner Heap, wie im Heartbeat (MALLOC_CAP_INTERNAL) — nur der wird knapp.
+extern RTC_NOINIT_ATTR uint32_t     crash_heap_free;  // frei bei der letzten Probe
+extern RTC_NOINIT_ATTR uint32_t     crash_heap_min;   // Tiefstwert dieses Laufs
+extern RTC_NOINIT_ATTR uint32_t     crash_heap_at;    // wann die Probe genommen wurde
+
 // ── Kopie im DRAM ───────────────────────────────────────────────────────────
 // ★★ WARUM eine Kopie: bis 03.08.2026 raeumte erst `slog_boot()` den RTC-Block
 // auf — die Funktion also, die bei einem fruehen Absturz gar nicht mehr laeuft.
@@ -188,6 +198,27 @@ inline char         snap_item[40] = {0};
 inline uint32_t     snap_item_at = 0;
 inline uint8_t      snap_seen_addr[6] = {0};
 inline uint32_t     snap_seen_at = 0;
+inline uint32_t     snap_heap_free = 0;
+inline uint32_t     snap_heap_min  = 0;
+inline uint32_t     snap_heap_at   = 0;
+
+// Speicherprobe fuer den Absturzkontext. ⚠ Gedrosselt: `slog_item()` steht im
+// Meldeweg und laeuft pro BLE-Geraet: `heap_caps_get_free_size()` nimmt kurz das
+// Heap-Schloss, und ein Schloss im heissen Pfad ist genau die Sorte Zutat, die
+// spaeter niemand mehr mit dem Absturz in Verbindung bringt. Fuenfmal je Sekunde
+// reicht vollkommen — der Absturz kommt nicht schneller.
+// ⚠ `heap_probe_ms` steht bewusst ohne Schloss: mehrere Tasks setzen die Marke,
+// im schlimmsten Fall gibt es eine Probe zuviel. Ein Schloss waere hier teurer
+// als der Fehler, den es verhindert.
+inline uint32_t heap_probe_ms = 0;
+inline void heap_note() {
+    uint32_t jetzt = (uint32_t)millis();
+    if (heap_probe_ms && (jetzt - heap_probe_ms) < 200) return;
+    heap_probe_ms  = jetzt ? jetzt : 1;
+    crash_heap_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    crash_heap_min  = (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    crash_heap_at   = jetzt / 1000;
+}
 
 inline void hb_task(void *) {
     for (;;) {
@@ -279,6 +310,7 @@ inline void slog_phase(const char *p) {
     strncpy(slog_detail::crash_phase, p, sizeof(slog_detail::crash_phase) - 1);
     slog_detail::crash_phase[sizeof(slog_detail::crash_phase) - 1] = 0;
     slog_detail::crash_phase_at = (uint32_t)(millis() / 1000);
+    slog_detail::heap_note();
 }
 
 // Welches Geraet die HAUPTSCHLEIFE gerade bearbeitet. Gleiche Kosten wie
@@ -288,6 +320,7 @@ inline void slog_item(const char *s) {
     strncpy(slog_detail::crash_item, s, sizeof(slog_detail::crash_item) - 1);
     slog_detail::crash_item[sizeof(slog_detail::crash_item) - 1] = 0;
     slog_detail::crash_item_at = (uint32_t)(millis() / 1000);
+    slog_detail::heap_note();
 }
 
 // Welche Aussendung der SCAN-TASK zuletzt hereinbekommen hat.
@@ -343,6 +376,9 @@ inline void slog_crash_capture() {
         slog_detail::snap_item[sizeof(slog_detail::snap_item) - 1] = 0;
         slog_sanitize(slog_detail::snap_item);
         slog_detail::snap_item_at = slog_detail::crash_item_at;
+        slog_detail::snap_heap_free = slog_detail::crash_heap_free;
+        slog_detail::snap_heap_min  = slog_detail::crash_heap_min;
+        slog_detail::snap_heap_at   = slog_detail::crash_heap_at;
         memcpy(slog_detail::snap_seen_addr, slog_detail::crash_seen_addr, 6);
         slog_detail::snap_seen_at = slog_detail::crash_seen_at;
     }
@@ -432,6 +468,18 @@ inline void slog_boot() {
         slog(SLOG_ERROR, "crashctx phase=%s phase_at=%lus last_at=%lus last=\"%s\"",
              slog_detail::snap_phase, (unsigned long)slog_detail::snap_phase_at,
              (unsigned long)slog_detail::snap_last_at, last);
+
+    // ★ Der Speicherstand kurz vor dem Absturz — eigene Zeile aus demselben Grund
+    // wie unten: die crashctx-Zeile ist mit `last=` schon nahe an den 300 Bytes des
+    // slog-Pakets. `at` sagt, wie frisch die Probe ist; liegt sie Minuten zurueck,
+    // gehoert sie nicht zum Absturz (dann lief der Knoten still vor sich hin).
+    if (slog_detail::snap_heap_at)          // `abnormal` + `snap_valid` sind oben schon gefiltert
+        slog(SLOG_ERROR, "crashheap free=%lu min=%lu at=%lus (vor %lus)",
+             (unsigned long)slog_detail::snap_heap_free,
+             (unsigned long)slog_detail::snap_heap_min,
+             (unsigned long)slog_detail::snap_heap_at,
+             (unsigned long)(slog_detail::snap_last_at > slog_detail::snap_heap_at
+                             ? slog_detail::snap_last_at - slog_detail::snap_heap_at : 0));
 
     // ★ Die beiden Task-Marken. Eigene Zeile: die crashctx-Zeile traegt schon bis zu
     // 108 Zeichen `last=` und das slog-Paket ist 300 Bytes gross — das wuerde knapp.

@@ -22,4 +22,7 @@ RTC_NOINIT_ATTR char         crash_item[40];
 RTC_NOINIT_ATTR uint32_t     crash_item_at;
 RTC_NOINIT_ATTR uint8_t      crash_seen_addr[6];
 RTC_NOINIT_ATTR uint32_t     crash_seen_at;
+RTC_NOINIT_ATTR uint32_t     crash_heap_free;
+RTC_NOINIT_ATTR uint32_t     crash_heap_min;
+RTC_NOINIT_ATTR uint32_t     crash_heap_at;
 }
