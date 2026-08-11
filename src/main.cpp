@@ -694,7 +694,17 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
         // Rohe Bytes, keine Zeichenkette — dieser Rueckruf feuert bei jeder
         // Aussendung, eine Allokation waere hier zu teuer und wuerde ausserdem
         // genau das veraendern, was gemessen werden soll.
+        // ⚠ NimBLE 1.4 (esp32-Umgebung) heisst der Zugriff getNative(), ab 2.x
+        // (s3/c3/c6) getVal(). Seit ca85f1f (06.08.2026) stand hier nur die alte
+        // Form — die esp32-Flotte baute, jeder andere Chip nicht mehr. Beim Bauen
+        // der Release-Abbilder am 11.08. aufgefallen.
+// Unterschieden am Include-Waechter des Headers: 1.4 = COMPONENTS_NIMBLEADDRESS_H_,
+// 2.x = NIMBLE_CPP_ADDRESS_H_. Eine Versionsnummer als Makro gibt es in 2.3.7 nicht.
+#if defined(NIMBLE_CPP_ADDRESS_H_)
+        slog_seen(advertisedDevice->getAddress().getVal());
+#else
         slog_seen(advertisedDevice->getAddress().getNative());
+#endif
         BleFingerprintCollection::Seen(advertisedDevice);
     }
 };
