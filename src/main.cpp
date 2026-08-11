@@ -30,7 +30,12 @@ void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *fu
 // of a silent permanent freeze. Deliberately independent of CONFIG_ASYNC_TCP_USE_WDT
 // (disabled fleet-wide, upstream default) - this doesn't rely on AsyncTCP's
 // own watchdog integration at all.
-#define TASK_WDT_TIMEOUT_MS 60000
+// ⚠ MUSS groesser sein als DEFAULT_WIFI_TIMEOUT (60 s, include/defaults.h).
+// Bei gleichem Wert stehen Watchdog und regulaerer WLAN-Timeout im Fotofinish,
+// und der Watchdog gewinnt — der Knoten stirbt in `net-connect`, statt in den
+// vorgesehenen Weg zu laufen. Gefuettert wird waehrend des Wartens ohnehin
+// (siehe onWaitLoop); der Abstand ist der zweite Riegel davor.
+#define TASK_WDT_TIMEOUT_MS 90000
 
 void setupTaskWatchdog() {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -286,16 +291,30 @@ void setupNetwork() {
 #endif
 
 
+    // ⚠ Beide Warteschleifen laufen auf dem LOOP-TASK, und der haengt seit
+    // setupTaskWatchdog() (Anfang von setup()) am Task-Watchdog. Wer hier nicht
+    // fuettert, wird beim Warten erschlagen, statt in den vorgesehenen Weg zu
+    // laufen (Timeout -> Portal -> Neustart).
+    //
+    // ★ Am 11.08.2026 in seshat nachgewiesen: waehrend der naechtlichen Sicherung
+    // antwortet HAs API nicht, der MQTT-Broker wirft alle Clients, reconnect()
+    // gibt nach 50 Versuchen auf und startet neu — und beim Neustart stand das
+    // Netz noch nicht. living_room 05:15:38 und pantry 05:15:44 kamen deshalb
+    // NICHT ueber `phase=net-connect` hinaus: reset=TASK_WDT statt sauberem
+    // Timeout. Das WLAN braucht sonst zwei Sekunden, deshalb faellt es nur bei
+    // gestoertem Netz auf — also genau dann, wenn man es am wenigsten braucht.
     unsigned int connectProgress = 0;
     HeadlessWiFiSettings.onWaitLoop = [&connectProgress]() {
         GUI::Wifi(connectProgress++);
         SerialImprov::Loop(true);
+        esp_task_wdt_reset();
         return 50;
     };
     unsigned int portalProgress = 0;
     HeadlessWiFiSettings.onPortalWaitLoop = [&portalProgress, portalTimeout]() {
         GUI::Portal(portalProgress++);
         SerialImprov::Loop(false);
+        esp_task_wdt_reset();
 
         if (millis() > portalTimeout)
             ESP.restart();
