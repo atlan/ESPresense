@@ -419,10 +419,36 @@ void onMqttConnect(bool sessionPresent) {
  *
  * @param reason The MQTT client's disconnection reason code.
  */
+// Longest single pass through loop() since the last time it was reported, and
+// when that pass happened. Written only here, read by onMqttDisconnect().
+//
+// Why measure this at all: the obvious explanation for a node being dropped
+// with "exceeded timeout" is that loop() blocked past the keepalive window --
+// but AsyncMqttClient pings from AsyncTCP's own task via _onPoll(), not from
+// loop(), so a slow loop should not cost the session. Either that model is
+// wrong or something starves the whole scheduler. Both are worth knowing, and
+// neither is guessable from outside the node.
+static uint32_t maxLoopMs = 0;
+static unsigned long maxLoopAt = 0;
+
+
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
     slog_phase("mqtt-disconnect");
     GUI::Connected(true, false);
-    Log.printf("Disconnected from MQTT; reason %d\r\n", (int)reason);
+    // "reason 0" alone (TCP_DISCONNECTED) says the socket went away and nothing
+    // about why. These four numbers are what a log reader actually needs to tell
+    // a stalled node from a flaky network from a starved heap -- and they cost
+    // one printf on an event that should be rare.
+    Log.printf("Disconnected from MQTT; reason %d up=%lus heap=%lu maxloop=%lums (%lus ago)\r\n",
+               (int)reason,
+               static_cast<unsigned long>(millis() / 1000),
+               static_cast<unsigned long>(ESP.getFreeHeap()),
+               static_cast<unsigned long>(maxLoopMs),
+               static_cast<unsigned long>(maxLoopAt ? (millis() - maxLoopAt) / 1000 : 0));
+    // Reset per session: the interesting number is "how long did a pass take
+    // during the session that just died", not an all-time high from boot.
+    maxLoopMs = 0;
+    maxLoopAt = 0;
     xTimerStart(reconnectTimer, 0);
     online = false;
 }
@@ -591,6 +617,20 @@ void connectToMqtt() {
     mqttClient.onConnect(onMqttConnect);
     mqttClient.onDisconnect(onMqttDisconnect);
     mqttClient.onMessage(onMqttMessageRaw);
+    // AsyncMqttClient defaults to a 15s keepalive, and a broker drops a client
+    // after 1.5x that -- 22.5 seconds of tolerance for a node that also runs a
+    // web server, NTP, the BLE report fan-out and every sensor driver.
+    //
+    // Measured (2026-09-05, mosquitto log): one node was dropped with
+    // "exceeded timeout" 52 times in 12 hours while its signal was FINE (RSSI
+    // median -64; a node at -76 ran 456 hours without a single drop). Each drop
+    // is followed by a reconnect, and it is the reconnect path that panics.
+    //
+    // 60s does not fix whatever stalls the node -- it gives the stall room to
+    // pass without costing a session. The trade is deliberate: setKeepAlive also
+    // arms AsyncTCP's receive timeout, so a genuinely dead broker now takes up
+    // to 60s to notice instead of 15.
+    mqttClient.setKeepAlive(60);
     mqttClient.setClientId(HeadlessWiFiSettings.hostname.c_str());
     mqttClient.setServer(mqttHost.c_str(), mqttPort);
     mqttClient.setWill(statusTopic.c_str(), 0, true, "offline");
@@ -842,6 +882,7 @@ void setup() {
  * SerialImprov, NTP, and (conditionally) AXP192 and various sensor modules.
  */
 void loop() {
+    auto loopStart = millis();
     esp_task_wdt_reset();
     reportLoop();
     static unsigned long lastSlowLoop = 0;
@@ -873,6 +914,17 @@ void loop() {
                 break;
         }
     }
+    auto loopMs = millis() - loopStart;
+    if (loopMs > maxLoopMs) {
+        maxLoopMs = loopMs;
+        maxLoopAt = millis();
+    }
+    // 5s is far past anything a healthy pass needs; log it as it happens rather
+    // than only on the next disconnect, so a stall that never costs a session
+    // still leaves a trace.
+    if (loopMs >= 5000)
+        Log.printf("loop stalled %lums\r\n", static_cast<unsigned long>(loopMs));
+
     GUI::Loop();
     Motion::Loop();
     Switch::Loop();

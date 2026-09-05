@@ -8,10 +8,29 @@
 
 bool pub(const char *topic, uint8_t qos, bool retain, const char *payload, size_t length, bool dup, uint16_t message_id)
 {
+    // Without a connection there is nothing to wait for. The retry loop used to
+    // run its full ten rounds regardless, sleeping 25ms between each -- 250ms per
+    // message that never had a chance.
+    //
+    // That cost is not paid once but per device: reportLoop() walks EVERY
+    // fingerprint and publishes each one, so a node tracking 100 devices spent
+    // 25 seconds spinning through a fan-out whose broker was already gone.
+    //
+    // Measured motivation (2026-09-04, 05:09:16): the broker became unreachable
+    // for a few seconds and seven nodes panicked within seven seconds of each
+    // other, all of them inside slog phase "rep-dev" -- this loop. A missing
+    // broker is a normal operating condition and must not take a node down.
+    if (!mqttClient.connected()) return false;
+
     for (int i = 0; i < 10; i++)
     {
         if (mqttClient.publish(topic, qos, retain, payload, length, dup, message_id))
             return true;
+        // Retrying is only meaningful while the connection still stands: a full
+        // outbound queue drains, a dropped session does not. Re-check between
+        // rounds so a disconnect mid-fan-out ends the wait instead of costing
+        // another 250ms for every remaining device.
+        if (!mqttClient.connected()) return false;
         delay(25);
     }
     return false;
