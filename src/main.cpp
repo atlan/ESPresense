@@ -303,15 +303,37 @@ void setupNetwork() {
     // NICHT ueber `phase=net-connect` hinaus: reset=TASK_WDT statt sauberem
     // Timeout. Das WLAN braucht sonst zwei Sekunden, deshalb faellt es nur bei
     // gestoertem Netz auf — also genau dann, wenn man es am wenigsten braucht.
-    unsigned int connectProgress = 0;
-    HeadlessWiFiSettings.onWaitLoop = [&connectProgress]() {
+    // ⛔⛔ Beide Zaehler MUESSEN `static` sein — sonst baumelt die Referenz.
+    //
+    // Die Lambdas landen in `HeadlessWiFiSettings` und leben damit ewig; die Zaehler
+    // lagen bis zum 06.09.2026 als LOKALE dieser Funktion auf dem Stapel des
+    // loop-Tasks und wurden per Referenz erfasst. Ab `return` (Zeile 404) zeigte die
+    // Referenz auf einen toten Stapelrahmen — und `reconnect()` ruft `onWaitLoop`
+    // spaeter aus dem FreeRTOS-Timer-Task alle 50 ms auf, schreibt also fremd in den
+    // dann LEBENDEN Stapel des loop-Tasks.
+    //
+    // ★ Warum das nur beim WLAN-Verlust knallt: `reconnect()` ruft
+    // `MultiNetwork.connect()` nur bei `!isOnline()`. Faellt bloss der Broker weg,
+    // laeuft `onWaitLoop` nie — belegt am 06.09.2026, als Mosquitto um 21:56:02 neu
+    // startete und floor das ueberlebte, 33 min spaeter aber am WLAN-Verlust starb.
+    // ⭐ In seshat gegengeprueft: ALLE 31 `phase=mqtt-reconnect`-Abstuerze der Flotte
+    // in 14 Tagen enden auf `"0 Reconnecting to Network..."`, KEINER auf
+    // `"Reconnecting to MQTT..."` — der Knoten stirbt genau auf diesem Zweig.
+    // ⚠ Ein Backtrace fehlt (Core-Dump ist hier nicht uebersetzt, siehe slog.h) —
+    // der Defekt ist sicher, der Todesstoss selbst bleibt indirekt belegt.
+    //
+    // `static` heisst zugleich: raus aus der Erfassungsliste (eine Variable mit
+    // statischer Lebensdauer laesst sich nicht erfassen, die Lambda greift direkt zu).
+    // `portalTimeout` bleibt per WERT erfasst — eine Kopie ist ohnehin gueltig.
+    static unsigned int connectProgress = 0;
+    HeadlessWiFiSettings.onWaitLoop = []() {
         GUI::Wifi(connectProgress++);
         SerialImprov::Loop(true);
         esp_task_wdt_reset();
         return 50;
     };
-    unsigned int portalProgress = 0;
-    HeadlessWiFiSettings.onPortalWaitLoop = [&portalProgress, portalTimeout]() {
+    static unsigned int portalProgress = 0;
+    HeadlessWiFiSettings.onPortalWaitLoop = [portalTimeout]() {
         GUI::Portal(portalProgress++);
         SerialImprov::Loop(false);
         esp_task_wdt_reset();
