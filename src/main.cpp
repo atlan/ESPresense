@@ -641,9 +641,47 @@ static void staggered_restart(const char *grund) {
     ESP.restart();
 }
 
+// ★★ Der Timer setzt nur noch eine Marke — die Arbeit macht loop().
+//
+// Experiment vom 07.09.2026. floor stirbt AUSNAHMSLOS auf dem Zweig
+// `!MultiNetwork.isOnline()`, 1–3 s nach "Reconnecting to Network..." (35 von 35
+// Abstuerzen; Zeilen mit "Reconnecting to MQTT..." werden immer ueberlebt).
+//
+// ⛔ Speicher ist als Ursache AUSGESCHLOSSEN, mit dem Messbau `885762d` belegt:
+// beim Tod um 13:29:30 waren **76 688 B frei**, `min_int` und `maxblk_int` standen
+// ueber sieben Lebenszeichen KONSTANT bei 44500 bzw. 34804, `maxloop` bei 215 ms —
+// und der neue `allocfail`-Melder schwieg. Vier unabhaengige Zahlen, alle gesund.
+//
+// Was auf diesem Zweig geschieht: `HeadlessWiFiSettings.connect()` reisst mit
+// `WiFi.mode(WIFI_OFF)` den ganzen WLAN-Stapel ab und baut ihn neu auf — bisher aus
+// dem FreeRTOS-TIMER-Task, waehrend AsyncTCP, der Webserver und NimBLE weiterlaufen.
+//
+// ★ Die Gegenprobe steckt schon im System: DERSELBE Aufruf laeuft beim Booten aus dem
+// loop-Task (`setupNetwork()`) und paniert dort NIE. Also wird genau EINE Variable
+// geaendert — welcher Task ihn ausfuehrt. Hoeren die Abstuerze auf, war es der
+// Task-Zusammenhang; laufen sie weiter, ist auch das eine belastbare Auskunft.
+// ⚠ Bewiesen ist bis dahin nichts. Ein Backtrace bleibt unmoeglich (Core-Dump ist auf
+// dieser Plattform nicht uebersetzt, siehe slog.h).
+//
+// ⚠ Zwei Nebenwirkungen, beide erwuenscht:
+// * Haengt `loop()`, findet kein Reconnect mehr statt — dafuer greift der Task-
+//   Watchdog (90 s, `setupTaskWatchdog()`) statt eines stillen Dauerhaengers.
+// * `esp_task_wdt_reset()` in `onWaitLoop` wirkt ueberhaupt erst jetzt: es fuettert
+//   immer den AUFRUFENDEN Task, und der Timer-Task ist beim Watchdog gar nicht
+//   angemeldet. Waehrend eines 40-Sekunden-Reconnects wurde der loop-Task also
+//   bisher NICHT gefuettert.
+static volatile bool reconnectPending = false;
+
 void reconnect(TimerHandle_t xTimer) {
-    slog_phase("mqtt-reconnect");
     Log.printf("%u Reconnect timer\r\n", xPortGetCoreID());
+    reconnectPending = true;
+}
+
+// Der eigentliche Wiederaufbau. Laeuft im loop-Task, aufgerufen aus `loop()`.
+// ⚠ Der Phasenmarker bleibt bewusst "mqtt-reconnect", damit die Absturzkontexte mit
+// den 35 bisherigen vergleichbar bleiben; welcher Bau lief, sagt `ver=`.
+static void reconnectNow() {
+    slog_phase("mqtt-reconnect");
     if (MultiNetwork.isOnline() && mqttClient.connected()) return;
 
     if (reconnectTries++ > 50) {
@@ -941,6 +979,11 @@ void setup() {
 void loop() {
     auto loopStart = millis();
     esp_task_wdt_reset();
+    // Netz zuerst: der Timer hat nur die Marke gesetzt, gearbeitet wird hier.
+    if (reconnectPending) {
+        reconnectPending = false;
+        reconnectNow();
+    }
     reportLoop();
     static unsigned long lastSlowLoop = 0;
     if (millis() - lastSlowLoop > 5000) {
