@@ -14,9 +14,37 @@
 #endif
 
 
+// ⚠ Dieser Haken laeuft INNERHALB des Allokators. Nichts hier darf allozieren
+// oder ein Schloss nehmen — `slog_alloc_failed()` merkt sich deshalb nur Zahlen
+// und einen kurzen Namen, gesendet wird spaeter aus dem Heartbeat-Task.
+// ★ 07.09.2026: `ESP_EARLY_LOGE` geht am Logger vorbei und landet damit NIE in
+// Loki. An floor war deshalb nicht zu sehen, WAS beim Reconnect nicht mehr
+// alloziert werden konnte — obwohl genau das die offene Frage ist.
+// Die Serial-Zeile bleibt: sie kommt auch dann noch heraus, wenn fuers Senden
+// kein Puffer mehr da ist.
 void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *functionName)
 {
     ESP_EARLY_LOGE("heap", "%s failed to allocate %lu bytes with 0x%lX capabilities", functionName, static_cast<unsigned long>(requestedSize), static_cast<unsigned long>(caps));
+    slog_alloc_failed(requestedSize, caps, functionName);
+}
+
+// ── Zusatzfelder fuers Lebenszeichen ───────────────────────────────────────
+// Der hb-Task darf weder allozieren noch ein Schloss nehmen. Deshalb:
+// * `fingerprints` wird von der MELDESCHLEIFE hinterlegt und hier nur gelesen
+//   — `BleFingerprintCollection::Size()` nimmt das fingerprintMutex und raeumt
+//   dabei sogar auf, das gehoert nicht in einen Diagnosepfad.
+//   ⚠ Haengt die Hauptschleife, ist der Wert veraltet. Zusammen mit `uptime`
+//   ist genau das die Auskunft, die man dann braucht.
+// * die Stapelreserven kommen ueber Task-Handles; `uxTaskGetStackHighWaterMark`
+//   braucht kein Schloss.
+static volatile uint32_t lastFingerprintCount = 0;
+static TaskHandle_t loopTaskHandle = nullptr;
+
+static void slogExtraFields(char *buf, size_t n) {
+    snprintf(buf, n, " fingerprints=%lu loopstack=%u scanstack=%u",
+             static_cast<unsigned long>(lastFingerprintCount),
+             loopTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(loopTaskHandle)) : 0u,
+             scanTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(scanTaskHandle)) : 0u);
 }
 
 // Independent hardware safety net: reconnect()'s own give-up-after-50-tries
@@ -701,6 +729,9 @@ void reportLoop() {
 
     yield();
     auto fingerprintCount = BleFingerprintCollection::Size();
+    // Fuers Lebenszeichen hinterlegen — der hb-Task darf Size() nicht selbst
+    // rufen (nimmt ein Schloss und raeumt auf), siehe slogExtraFields().
+    lastFingerprintCount = static_cast<uint32_t>(fingerprintCount);
 
     unsigned int count = 0;
     size_t cursor = 0;
@@ -848,6 +879,10 @@ void setup() {
 #endif
     Log.printf("Pre-Setup Free Mem: %lu\r\n", static_cast<unsigned long>(ESP.getFreeHeap()));
     heap_caps_register_failed_alloc_callback(heapCapsAllocFailedHook);
+    // Handle der Hauptschleife merken: der hb-Task liest darueber ihre
+    // Stapelreserve. setup() laeuft auf genau diesem Task.
+    loopTaskHandle = xTaskGetCurrentTaskHandle();
+    slog_set_extra(slogExtraFields);
     setupTaskWatchdog();
 
 #if M5STICK

@@ -220,20 +220,88 @@ inline void heap_note() {
     crash_heap_at   = jetzt / 1000;
 }
 
+// ── Fehlgeschlagene Allokationen sichtbar machen ────────────────────────────
+//
+// ⚠⚠ Der IDF-Haken laeuft INNERHALB des Allokators und kann aus jedem Task,
+// auch aus einem Interrupt kommen. Er darf deshalb weder allozieren noch ein
+// Schloss nehmen — sonst rekursiert oder haengt er genau in dem Augenblick, in
+// dem der Speicher ohnehin schon knapp ist. Hier stehen darum nur skalare
+// Zuweisungen und eine laengenbegrenzte Kopie; GEMELDET wird spaeter, aus dem
+// Heartbeat-Task.
+// ⚠ `af_n` wird ungeschuetzt erhoeht: geht bei einem Rennen einer verloren, ist
+// das fuer eine Diagnose belanglos — ein Schloss waere hier teurer als der
+// Fehler, den es verhindert.
+// ★ Warum ueberhaupt: bis zum 07.09.2026 ging der Haken nur per ESP_EARLY_LOGE
+// nach Serial. Das umgeht den Logger und landet damit NIE in Loki — an floor
+// war deshalb nicht zu sehen, was beim Reconnect nicht mehr alloziert werden
+// konnte, obwohl genau das die offene Frage war.
+inline volatile uint32_t af_n = 0;      // nur wachsend; Wechsel = neue Meldung
+inline volatile uint32_t af_size = 0;
+inline volatile uint32_t af_caps = 0;
+inline volatile uint32_t af_at = 0;
+inline char              af_fn[24] = {0};
+inline uint32_t          af_reported = 0;   // nur der hb-Task fasst das an
+
+// Zusatzfelder fuers Heartbeat, vom Projekt gestellt. ⚠ Der Rueckruf laeuft im
+// hb-Task: er darf NICHT allozieren und KEIN Schloss nehmen (sonst haengt das
+// Lebenszeichen genau dann, wenn es gebraucht wird).
+inline void (*extra_cb)(char *, size_t) = nullptr;
+
+// Takt des hb-Tasks. Das Lebenszeichen bleibt bei SLOG_HEARTBEAT_MS; der
+// schnellere Takt ist nur fuer die Allokationsfehler da — die stehen kurz vor
+// dem Absturz, ein 5-Minuten-Raster wuerde sie verschlucken.
+#ifndef SLOG_HB_TICK_MS
+#define SLOG_HB_TICK_MS 5000
+#endif
+
 inline void hb_task(void *) {
+    uint32_t seit_hb = 0;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SLOG_HEARTBEAT_MS));
-        if (WiFi.status() == WL_CONNECTED)
-            // Einheitliches Fleet-Heartbeat-Schema (siehe arkon-infra/esp/STANDARDS.md).
-            slog(SLOG_DEBUG, "heartbeat uptime=%lus free_int=%u free_ext=%u min_int=%u rssi=%d ip=%s ver=%s txfail=%lu",
-                 (unsigned long)(millis() / 1000),
+        vTaskDelay(pdMS_TO_TICKS(SLOG_HB_TICK_MS));
+        if (WiFi.status() != WL_CONNECTED) continue;
+
+        // ★ Zuerst und zeitnah die Allokationsfehler. Der hb-Task ist dafuer der
+        // richtige Ort: er laeuft weiter, auch wenn die Hauptschleife haengt (an
+        // floor am 07.09.2026 gemessen: maxloop 4069 ms statt sonst 76 ms).
+        // ⚠ Der Versand selbst braucht einen Puffer — bei ganz knappem Speicher
+        // kann er scheitern. Dann zaehlt `txfail` hoch; das ist die ehrlichere
+        // Auskunft als gar keine.
+        if (af_n != af_reported) {
+            af_reported = af_n;
+            slog(SLOG_ERROR, "allocfail n=%lu size=%lu caps=0x%lX fn=%s at=%lus free_int=%u maxblk_int=%u",
+                 (unsigned long)af_reported,
+                 (unsigned long)af_size,
+                 (unsigned long)af_caps,
+                 af_fn[0] ? af_fn : "?",
+                 (unsigned long)af_at,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                 (int)WiFi.RSSI(),
-                 WiFi.localIP().toString().c_str(),
-                 SLOG_FW_VERSION,
-                 (unsigned long)tx_fail);
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
+
+        seit_hb += SLOG_HB_TICK_MS;
+        if (seit_hb < SLOG_HEARTBEAT_MS) continue;
+        seit_hb = 0;
+
+        char extra[112];
+        extra[0] = 0;
+        if (extra_cb) extra_cb(extra, sizeof(extra));
+
+        // Einheitliches Fleet-Heartbeat-Schema (siehe arkon-infra/esp/STANDARDS.md).
+        // ★ `maxblk_int` neu am 07.09.2026: `free_int` sagt NICHT, ob eine grosse
+        // Allokation noch durchgeht. Der WLAN-Neuaufbau im Reconnect braucht einen
+        // zusammenhaengenden Block — bei Fragmentierung kann er scheitern, waehrend
+        // die Summe noch beruhigend aussieht.
+        slog(SLOG_DEBUG, "heartbeat uptime=%lus free_int=%u free_ext=%u min_int=%u maxblk_int=%u rssi=%d ip=%s ver=%s txfail=%lu%s",
+             (unsigned long)(millis() / 1000),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (int)WiFi.RSSI(),
+             WiFi.localIP().toString().c_str(),
+             SLOG_FW_VERSION,
+             (unsigned long)tx_fail,
+             extra);
     }
 }
 
@@ -311,6 +379,38 @@ inline void slog_phase(const char *p) {
     slog_detail::crash_phase[sizeof(slog_detail::crash_phase) - 1] = 0;
     slog_detail::crash_phase_at = (uint32_t)(millis() / 1000);
     slog_detail::heap_note();
+}
+
+// Meldet eine fehlgeschlagene Allokation. Gedacht als Rumpf des IDF-Hakens
+// `heap_caps_register_failed_alloc_callback()`.
+//
+// ⚠⚠ Laeuft INNERHALB des Allokators, moeglicherweise aus einem Interrupt:
+// hier darf NICHTS alloziert und KEIN Schloss genommen werden. Deshalb nur
+// skalare Zuweisungen und eine begrenzte Kopie des Funktionsnamens — kein
+// strncpy, kein snprintf, kein slog(). Der hb-Task holt das ab.
+// ★ Reihenfolge mit Absicht: erst die Einzelheiten, GANZ ZULETZT der Zaehler.
+// Sonst koennte der Leser eine neue Zahl mit alten Werten daneben sehen.
+inline void slog_alloc_failed(size_t size, uint32_t caps, const char *fn) {
+    slog_detail::af_size = (uint32_t)size;
+    slog_detail::af_caps = caps;
+    slog_detail::af_at   = (uint32_t)(millis() / 1000);
+    if (fn) {
+        size_t i = 0;
+        while (i + 1 < sizeof(slog_detail::af_fn) && fn[i]) { slog_detail::af_fn[i] = fn[i]; i++; }
+        slog_detail::af_fn[i] = 0;
+    } else {
+        slog_detail::af_fn[0] = 0;
+    }
+    slog_detail::af_n++;
+}
+
+// Haengt projekteigene Felder ans Lebenszeichen (Format " k=v k=v", mit
+// fuehrendem Leerzeichen). ⚠ Der Rueckruf laeuft im hb-Task und darf weder
+// allozieren noch ein Schloss nehmen — sonst blockiert er das Lebenszeichen
+// genau dann, wenn der Knoten in Not ist und seshat den "Geraet still"-Alarm
+// ausloesen wuerde.
+inline void slog_set_extra(void (*cb)(char *, size_t)) {
+    slog_detail::extra_cb = cb;
 }
 
 // Welches Geraet die HAUPTSCHLEIFE gerade bearbeitet. Gleiche Kosten wie
@@ -412,8 +512,12 @@ inline void slog(int sev, const char *fmt, ...) {
     // Der Mutex serialisiert zugleich den Versand (WiFiUDP ist NICHT thread-safe).
     if (!slog_detail::udp_mtx ||
         xSemaphoreTake(slog_detail::udp_mtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
-    static char msg[200];
-    static char pkt[300];
+    // ⚠ Am 07.09.2026 vergroessert. Das Lebenszeichen traegt jetzt `maxblk_int`
+    // plus die Projekt-Zusatzfelder und lag bei 200 B knapp an der Grenze —
+    // eine stille Kuerzung haette ausgerechnet die neuen Felder gefressen.
+    // Beide Puffer sind statisch (.bss), kosten also keinen Stapel.
+    static char msg[256];
+    static char pkt[400];
     va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
     int pri = 16 * 8 + (sev & 7);   // facility local0
     int n = snprintf(pkt, sizeof(pkt), "<%d>1 - %s %s - - - %s %s %s",
