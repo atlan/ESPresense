@@ -7,6 +7,16 @@ const char *const EC_NONE = "";
 
 static const char *const DEVICE_CLASS_NONE = "";
 
+// Sendeweg-Zaehler. `publish()` liefert 0, waehrend `connected()` noch wahr
+// ist: die Sitzung steht, aber es geht nichts mehr raus. Genau diese
+// Unterscheidung fehlte am 07./08.09.2026 -- der Broker warf floor alle 94 s
+// mit "exceeded timeout", also nach 90 s voelliger Funkstille, obwohl der
+// Knoten durchgehend 24-28 Geraete verfolgte und sein UDP-Syslog luecken-
+// los weiterlief. retry = eine erfolglose Runde, gaveup = alle zehn vergebens.
+extern volatile uint32_t mqttPubOk;
+extern volatile uint32_t mqttPubRetry;
+extern volatile uint32_t mqttPubGaveUp;
+
 bool pub(const char *topic, uint8_t qos, bool retain, const char *payload, size_t length = 0, bool dup = false, uint16_t message_id = 0);
 bool pub(const char *topic, uint8_t qos, bool retain, JsonVariantConst jsonDoc, bool dup = false, uint16_t message_id = 0);
 void commonDiscovery();

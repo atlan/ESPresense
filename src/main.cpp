@@ -40,12 +40,7 @@ void heapCapsAllocFailedHook(size_t requestedSize, uint32_t caps, const char *fu
 static volatile uint32_t lastFingerprintCount = 0;
 static TaskHandle_t loopTaskHandle = nullptr;
 
-static void slogExtraFields(char *buf, size_t n) {
-    snprintf(buf, n, " fingerprints=%lu loopstack=%u scanstack=%u",
-             static_cast<unsigned long>(lastFingerprintCount),
-             loopTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(loopTaskHandle)) : 0u,
-             scanTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(scanTaskHandle)) : 0u);
-}
+static void slogExtraFields(char *buf, size_t n);
 
 // Independent hardware safety net: reconnect()'s own give-up-after-50-tries
 // restart runs on a FreeRTOS software timer, which stops firing if the
@@ -481,6 +476,32 @@ void onMqttConnect(bool sessionPresent) {
 static uint32_t maxLoopMs = 0;
 static unsigned long maxLoopAt = 0;
 
+// Der AsyncTCP-Task ist der gemeinsame Nenner der beiden Broker-Meldungen:
+// AsyncMqttClient sendet den Keepalive-Ping aus SEINEM `_onPoll()`, und jede
+// Veroeffentlichung wird aus SEINER Warteschlange auf die Leitung gelegt.
+// Steht er, hoert der Broker 90 s lang gar nichts -- genau das Bild vom
+// 07./08.09.2026. Zustand und Stapelreserve kosten nichts und sagen, ob er
+// laeuft, blockiert oder nur nichts zu tun hat.
+static TaskHandle_t asyncTcpTaskHandle = nullptr;
+
+static void slogExtraFields(char *buf, size_t n) {
+    if (!asyncTcpTaskHandle) asyncTcpTaskHandle = xTaskGetHandle("async_tcp");
+    // eTaskGetState: 0=Running 1=Ready 2=Blocked 3=Suspended 4=Deleted, 9=nicht da
+    unsigned atcpState = asyncTcpTaskHandle ? static_cast<unsigned>(eTaskGetState(asyncTcpTaskHandle)) : 9u;
+    snprintf(buf, n, " fingerprints=%lu loopstack=%u scanstack=%u maxloop=%lu maxloopago=%lu"
+                     " pubok=%lu pubretry=%lu pubgave=%lu atcp=%u atcpstack=%u",
+             static_cast<unsigned long>(lastFingerprintCount),
+             loopTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(loopTaskHandle)) : 0u,
+             scanTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(scanTaskHandle)) : 0u,
+             static_cast<unsigned long>(maxLoopMs),
+             static_cast<unsigned long>(maxLoopAt ? (millis() - maxLoopAt) / 1000 : 0),
+             static_cast<unsigned long>(mqttPubOk),
+             static_cast<unsigned long>(mqttPubRetry),
+             static_cast<unsigned long>(mqttPubGaveUp),
+             atcpState,
+             asyncTcpTaskHandle ? static_cast<unsigned>(uxTaskGetStackHighWaterMark(asyncTcpTaskHandle)) : 0u);
+}
+
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
     slog_phase("mqtt-disconnect");
@@ -489,16 +510,29 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
     // about why. These four numbers are what a log reader actually needs to tell
     // a stalled node from a flaky network from a starved heap -- and they cost
     // one printf on an event that should be rare.
-    Log.printf("Disconnected from MQTT; reason %d up=%lus heap=%lu maxloop=%lums (%lus ago)\r\n",
+    // pubok/pubretry/pubgave beantworten die Frage, die "reason 0" offen laesst:
+    // hat der Knoten in dieser Sitzung ueberhaupt etwas auf die Leitung bekommen?
+    // atcp = Zustand des AsyncTCP-Tasks (0=Running 1=Ready 2=Blocked 3=Susp 9=weg),
+    // der Ping UND Veroeffentlichung gleichermassen traegt.
+    if (!asyncTcpTaskHandle) asyncTcpTaskHandle = xTaskGetHandle("async_tcp");
+    Log.printf("Disconnected from MQTT; reason %d up=%lus heap=%lu maxloop=%lums (%lus ago)"
+               " pubok=%lu pubretry=%lu pubgave=%lu atcp=%u\r\n",
                (int)reason,
                static_cast<unsigned long>(millis() / 1000),
                static_cast<unsigned long>(ESP.getFreeHeap()),
                static_cast<unsigned long>(maxLoopMs),
-               static_cast<unsigned long>(maxLoopAt ? (millis() - maxLoopAt) / 1000 : 0));
+               static_cast<unsigned long>(maxLoopAt ? (millis() - maxLoopAt) / 1000 : 0),
+               static_cast<unsigned long>(mqttPubOk),
+               static_cast<unsigned long>(mqttPubRetry),
+               static_cast<unsigned long>(mqttPubGaveUp),
+               asyncTcpTaskHandle ? static_cast<unsigned>(eTaskGetState(asyncTcpTaskHandle)) : 9u);
     // Reset per session: the interesting number is "how long did a pass take
     // during the session that just died", not an all-time high from boot.
     maxLoopMs = 0;
     maxLoopAt = 0;
+    mqttPubOk = 0;
+    mqttPubRetry = 0;
+    mqttPubGaveUp = 0;
     xTimerStart(reconnectTimer, 0);
     online = false;
 }

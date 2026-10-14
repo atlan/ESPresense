@@ -6,6 +6,10 @@
 #include <WiFi.h>
 #include <memory>
 
+volatile uint32_t mqttPubOk = 0;
+volatile uint32_t mqttPubRetry = 0;
+volatile uint32_t mqttPubGaveUp = 0;
+
 bool pub(const char *topic, uint8_t qos, bool retain, const char *payload, size_t length, bool dup, uint16_t message_id)
 {
     // Without a connection there is nothing to wait for. The retry loop used to
@@ -25,7 +29,11 @@ bool pub(const char *topic, uint8_t qos, bool retain, const char *payload, size_
     for (int i = 0; i < 10; i++)
     {
         if (mqttClient.publish(topic, qos, retain, payload, length, dup, message_id))
+        {
+            mqttPubOk++;
             return true;
+        }
+        mqttPubRetry++;
         // Retrying is only meaningful while the connection still stands: a full
         // outbound queue drains, a dropped session does not. Re-check between
         // rounds so a disconnect mid-fan-out ends the wait instead of costing
@@ -33,6 +41,7 @@ bool pub(const char *topic, uint8_t qos, bool retain, const char *payload, size_
         if (!mqttClient.connected()) return false;
         delay(25);
     }
+    mqttPubGaveUp++;
     return false;
 }
 
